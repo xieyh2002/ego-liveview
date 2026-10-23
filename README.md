@@ -71,13 +71,16 @@ git clone https://github.com/xieyh2002/ego-liveview.git
 
 只允许 loopback 访问（Host 头必须是 `127.0.0.1` / `localhost` / `[::1]`），否则 403。
 
-## 两个必须知道的坑
+## 三个必须知道的坑
 
 **1. ego 的窗口必须是「显示过」的状态。**
 ego.exe 用 `--startup-ego-browser-service` 起来时窗口是隐藏的（`IsWindowVisible=false`）。隐藏窗口的合成器**一帧都不提交**：`Page.screencastFrame` 不来，`Page.captureScreenshot` 直接超时。所以 bridge 启动时会调一次 `bridge/wake-windows.ps1`，用 `ShowWindow(hwnd, 7)`（SW_SHOWMINNOACTIVE，最小化、不抢焦点、不挡屏）把隐藏的 `Chrome_WidgetWin_1` 窗口显示一下。只要显示过一次，之后就一直出帧。
 
 **2. 千万别在要跑 screencast 的 target 上调 `Page.captureScreenshot`。**
 窗口最小化时它会报 `Cannot capture a screenshot while the window is minimized.` 并超时，而这个超时会让该 target 的 screencast **永久不再出帧**（重启 ego 才能恢复）。早期所有「0 帧」的排查都是踩在这上面。要帧就用 screencast，不要混着截图。
+
+**3. ego 长时间跑过之后，取帧管线会整体失效，重启 ego 才回来。**
+症状：`/ego-live/status` 里 `ok:true`、metadata 正常刷新、`watched` 指向正确页面，但 `framesSeen` 不涨、`lastFrameAgeMs` 一直变大、侧边栏画面冻住。此时窗口状态、rAF、`Performance.getMetrics` 的 `Frames` 计数都正常（说明页面在渲染），只有 screencast 不出帧，`Page.captureScreenshot` 超时、`stopScreencast`+`startScreencast` 也救不回来。实测在 ego 连续跑约 3 小时后出现，重启 ego 后立刻恢复到 65–85 fps。重启 ego 会让所有 TaskSpace 清空，插件会显示「ego 里还没有打开的网页」，让 dsh 重新开一个页面即可。
 
 其它实测数据：单进程内 screencast 稳定 **58–82 fps**、JPEG q60 960×600 约 17–25 KB/帧、首个管道连接 118ms、首帧 459ms。静态页面不出帧是正常行为（screencast 只在合成器有变化时发帧），所以 `ensureBridge()` 判活用的是 **metadata 心跳**而不是帧到达。
 
@@ -91,7 +94,10 @@ ego.exe 用 `--startup-ego-browser-service` 起来时窗口是隐藏的（`IsWin
 | `maxWidth` / `maxHeight` | `960` / `600` | 缩放上限（比这大的页面会被缩） |
 | `space` | `''` | 空 = 自动跟随最新 space；填名字或 id 就固定看那个 |
 | `idleTimeoutMs` | `20000` | 多久没心跳就重启 bridge |
+| `healthCheckMs` | `5000` | 看门狗检查间隔；`0` 关闭（不推荐，见下） |
 | `egoBinary` | `ego-browser` | CLI 路径 |
+
+`healthCheckMs` 不能关：MJPEG 的 `<img>` 是一个长连接，断了之后浏览器**不会再发新请求**，所以没有看门狗的话管道一死侧边栏就永久冻住，直到用户手动刷新页面。看门狗判活用的是 metadata 心跳而不是帧到达（静态页本来就不出帧）。
 
 改完代码要**重启 DSH** 才生效（bridge.mjs 只在插件加载时复制到 `%TEMP%\ego-liveview-runtime\`，运行中的 pump 是内存里的旧版）。
 
