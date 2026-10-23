@@ -54,6 +54,24 @@ const MAX_PAYLOAD = 8 * 1024 * 1024;
 /** How long a single MJPEG part may sit unflushed before the viewer is unmuted. */
 const WRITE_STALL_MS = 1_000;
 
+/**
+ * How long after the last polled frame the viewer still counts as present.
+ *
+ * The client polls /frame.jpg every 120 ms, so anything above that keeps it
+ * continuously "present"; the extra margin covers a slow request or a briefly
+ * backgrounded tab. It also bounds how long ego stays up after a tab closes.
+ */
+const DEMAND_GRACE_MS = 10_000;
+
+/**
+ * Minimum gap between bridge launch attempts.
+ *
+ * A polling client asks for a frame every ~120 ms, so without this a failing
+ * launch (ego missing, ego crashing on start) would be retried thousands of
+ * times a minute. One second is invisible to a user and harmless to ego.
+ */
+const RETRY_FLOOR_MS = 1_000;
+
 const DEFAULTS = {
   quality: 60,
   maxWidth: 960,
@@ -64,6 +82,15 @@ const DEFAULTS = {
   idleTimeoutMs: 20_000,
   /** How often the watchdog re-checks the bridge. 0 disables it. */
   healthCheckMs: 5_000,
+  /**
+   * Reveal hidden ego windows so the compositor starts submitting frames.
+   *
+   * Only relevant on ego builds that launch their service instance with a
+   * hidden window (0.6.0.16 did; 0.6.0.20 starts visible and the script finds
+   * nothing to show). Off by default: touching another app's window visibility
+   * is not something a sidebar viewer should do uninvited.
+   */
+  showWindow: false,
   egoBinary: 'ego-browser',
 };
 
@@ -85,6 +112,17 @@ export function apply(ctx, config) {
    * is the heartbeat. */
   let lastMetaAt = 0;
   const viewers = new Set();
+  /**
+   * Last time any route was asked for a frame.
+   *
+   * MJPEG viewers are tracked directly, but the image endpoint is stateless
+   * polling: the client re-requests /frame.jpg every 120 ms without ever
+   * becoming a viewer. Without this, the watchdog would tear the bridge down
+   * mid-poll and the two would fight each other forever.
+   */
+  let lastDemandAt = 0;
+  /** When startBridge() was last attempted, to keep retries off a hot loop. */
+  let lastAttemptAt = 0;
 
   /** One bridge instance: the child process plus its pipe client. */
   const bridge = {
@@ -132,7 +170,9 @@ export function apply(ctx, config) {
       // ego's host inherits no environment and buffers stderr until the child
       // exits, so the bridge can only report through a file it opens itself.
       logFile: path.join(RUNTIME_DIR, 'bridge.log'),
-      wakeScript: path.join(RUNTIME_DIR, 'wake-windows.ps1'),
+      // Omitted entirely unless asked for: the bridge skips the wake entirely
+      // when the key is absent, so ego's window is never touched by default.
+      wakeScript: conf.showWindow ? runtimeWake : null,
     };
     const boot = `globalThis.__EGO_LIVE_CONFIG = ${JSON.stringify(cfg)};
 await import(${JSON.stringify('file:///' + runtimeBridge.replace(/\\/g, '/'))});
@@ -299,6 +339,10 @@ await import(${JSON.stringify('file:///' + runtimeBridge.replace(/\\/g, '/'))});
    */
   async function ensureBridge() {
     if (bridge.socket && Date.now() - lastMetaAt < conf.idleTimeoutMs) return true;
+    // A polling client re-requests ~8×/s, and the watchdog fires too. Without a
+    // floor between attempts, a failing launch would be retried in a hot loop;
+    // with it, retries stay at a human pace while a healthy start never waits.
+    if (Date.now() - lastAttemptAt < RETRY_FLOOR_MS) return false;
     if (bridge.socket) {
       note(`bridge heartbeat stale (${Math.round((Date.now() - lastMetaAt) / 1000)}s); restarting`);
       const old = bridge.socket;
@@ -309,7 +353,49 @@ await import(${JSON.stringify('file:///' + runtimeBridge.replace(/\\/g, '/'))});
     // 0 (or long stale) and the watchdog would restart the bridge it just
     // started, forever, before the first metadata tick ever arrives.
     lastMetaAt = Date.now();
+    lastAttemptAt = Date.now();
     return startBridge();
+  }
+
+  /**
+   * Drop our connection to the bridge, and stop the CLI we started.
+   *
+   * The ego process itself is deliberately left alone: it may be a browser the
+   * user is using for their own work, and a sidebar viewer has no business
+   * killing it. Only the pipe and the child we spawned are ours to close.
+   */
+  function shutdownBridge(reason) {
+    if (!bridge.socket && !bridge.child) return;
+    note(`releasing bridge (${reason})`);
+    try {
+      bridge.socket?.destroy();
+    } catch {}
+    try {
+      bridge.child?.kill();
+    } catch {}
+    bridge.socket = null;
+    bridge.child = null;
+    bridge.pipe = null;
+    bridge.startedAt = 0;
+    // Frames belong to the bridge that produced them; keeping them would show a
+    // stale picture as if it were live.
+    lastFrame = null;
+    frameSeq = 0;
+    lastFrameAt = 0;
+    lastMetaAt = 0;
+    meta = { ...meta, url: '', title: '', label: null, spaceId: null, spaceName: null, viewport: null, fps: 0, spaces: [] };
+  }
+
+  /**
+   * Is anyone watching right now?
+   *
+   * True while an MJPEG response is open, or for a short grace period after the
+   * last polled frame — long enough that a polling client never looks absent
+   * between requests, short enough that a closed tab stops keeping ego alive.
+   */
+  function demandActive() {
+    if (viewers.size > 0) return true;
+    return lastDemandAt > 0 && Date.now() - lastDemandAt < DEMAND_GRACE_MS;
   }
 
   /** Only loopback callers; the stream exposes whatever the browser shows. */
@@ -336,6 +422,7 @@ await import(${JSON.stringify('file:///' + runtimeBridge.replace(/\\/g, '/'))});
       path: STREAM_ROUTE,
       async handler(req, res) {
         if (!guard(req, res)) return;
+        lastDemandAt = Date.now();
         res.writeHead(200, {
           'content-type': 'multipart/x-mixed-replace; boundary=frame',
           'cache-control': 'no-store, no-transform',
@@ -348,7 +435,13 @@ await import(${JSON.stringify('file:///' + runtimeBridge.replace(/\\/g, '/'))});
         viewers.add(viewer);
         // Paint something within one frame time even on a static page.
         if (lastFrame) writePart(viewer, lastFrame);
-        const drop = () => viewers.delete(viewer);
+        const drop = () => {
+          if (!viewers.delete(viewer)) return;
+          // Nobody left watching: release the bridge rather than keeping a pump
+          // (and ego's window) alive for nobody. The next open restarts it. The
+          // watchdog would also notice, but doing it here frees ego immediately.
+          if (!demandActive()) shutdownBridge('last viewer left');
+        };
         req.on('close', drop);
         req.on('error', drop);
         res.on('error', drop);
@@ -364,6 +457,7 @@ await import(${JSON.stringify('file:///' + runtimeBridge.replace(/\\/g, '/'))});
       path: FRAME_ROUTE,
       async handler(req, res) {
         if (!guard(req, res)) return;
+        lastDemandAt = Date.now();
         if (!lastFrame) await ensureBridge().catch(() => {});
         if (!lastFrame) {
           res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8' });
@@ -387,7 +481,11 @@ await import(${JSON.stringify('file:///' + runtimeBridge.replace(/\\/g, '/'))});
       async handler(req, res) {
         if (!guard(req, res)) return;
         const body = JSON.stringify({
+          // `ok` only ever meant "a pipe is attached", which stayed true while
+          // producing nothing (empty ego, no watchable page). `watching` is the
+          // honest signal: attached AND following a real page.
           ok: Boolean(bridge.socket),
+          watching: Boolean(bridge.socket && meta.spaceId !== null),
           seq: frameSeq,
           framesSeen: bridge.framesSeen,
           viewers: viewers.size,
@@ -414,16 +512,27 @@ await import(${JSON.stringify('file:///' + runtimeBridge.replace(/\\/g, '/'))});
     }),
   );
 
-  // Warm the bridge so the first sidebar click is instant rather than ~1 s.
-  void ensureBridge().catch((err) => note(`warmup: ${err.message}`));
+  // Deliberately no warm-up call here. Launching the bridge means launching
+  // ego (`ego-browser` starts an `ego.exe --startup-ego-browser-service` if
+  // none is running), so warming it would make DSH's own start-up spawn a
+  // browser nobody asked for. Both routes below call ensureBridge() on demand.
 
   // MJPEG viewers hold one long-lived response and never re-request, so nothing
   // calls ensureBridge() after the initial attach. Without this watchdog a pipe
   // that dies (ego closed the connection, ego restarted, the CLI exited) leaves
   // the sidebar frozen forever — the <img> has no way to trigger a restart.
+  //
+  // It only ever revives a bridge while someone is actually watching. With no
+  // viewers, a dead bridge is the user having closed ego, and restarting it
+  // would fight them: that exact loop (spawn → user closes → spawn) is what
+  // made the plugin relaunch ego forever.
   let watchdog = null;
   if (conf.healthCheckMs > 0) {
     watchdog = setInterval(() => {
+      if (!demandActive()) {
+        shutdownBridge('idle: nobody watching');
+        return;
+      }
       ensureBridge().catch((err) => note(`watchdog: ${err.message}`));
     }, conf.healthCheckMs);
     watchdog.unref?.();
@@ -442,16 +551,9 @@ await import(${JSON.stringify('file:///' + runtimeBridge.replace(/\\/g, '/'))});
       } catch {}
     }
     viewers.clear();
-    try {
-      bridge.socket?.destroy();
-    } catch {}
     // Killing the CLI does not stop the pump inside the ego host (it was
     // started by a call that already returned); a fresh pipe name per launch
     // is what keeps old pumps harmless.
-    try {
-      bridge.child?.kill();
-    } catch {}
-    bridge.child = null;
-    bridge.socket = null;
+    shutdownBridge('plugin unloading');
   });
 }

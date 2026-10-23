@@ -71,10 +71,20 @@ git clone https://github.com/xieyh2002/ego-liveview.git
 
 只允许 loopback 访问（Host 头必须是 `127.0.0.1` / `localhost` / `[::1]`），否则 403。
 
+## ego 什么时候被启动
+
+**它不会自己启动。** 插件 load 进 DSH 之后处于完全待命状态：不 spawn `ego-browser`、不碰 ego 窗口、不占任何管道。只有侧边栏那个 tab 真的在拉流（`viewers.size > 0`）时，bridge 才会起来；最后一个观众离开后立刻释放（`releasing bridge (last viewer left)`）。
+
+这一点很重要，因为 `ego-browser` CLI **会连带拉起一个完整的 ego 实例**（`ego-browser.exe` → `ego.exe --startup-ego-browser-service`）。如果在 load 时就预热，等于 DSH 一启动就凭空多一个浏览器进程和一个没人看的新标签页窗口。
+
+看门狗同样受这个门控：没人看的时候它不会重启任何东西，只会把残留的 bridge 收掉。所以 `taskkill /IM ego.exe /F` 之后的行为是——有观众就恢复，没观众就不恢复。
+
 ## 三个必须知道的坑
 
 **1. ego 的窗口必须是「显示过」的状态。**
-ego.exe 用 `--startup-ego-browser-service` 起来时窗口是隐藏的（`IsWindowVisible=false`）。隐藏窗口的合成器**一帧都不提交**：`Page.screencastFrame` 不来，`Page.captureScreenshot` 直接超时。所以 bridge 启动时会调一次 `bridge/wake-windows.ps1`，用 `ShowWindow(hwnd, 7)`（SW_SHOWMINNOACTIVE，最小化、不抢焦点、不挡屏）把隐藏的 `Chrome_WidgetWin_1` 窗口显示一下。只要显示过一次，之后就一直出帧。
+ego.exe 用 `--startup-ego-browser-service` 起来时，**老版本（0.6.0.16）**窗口是隐藏的（`IsWindowVisible=false`）。隐藏窗口的合成器**一帧都不提交**：`Page.screencastFrame` 不来，`Page.captureScreenshot` 直接超时。这种情况下把 `showWindow: true` 打开，bridge 会调一次 `bridge/wake-windows.ps1`，用 `ShowWindow(hwnd, 7)`（SW_SHOWMINNOACTIVE，最小化、不抢焦点、不挡屏）把隐藏的 `Chrome_WidgetWin_1` 窗口显示一下；只要显示过一次，之后就一直出帧。
+
+0.6.0.20 起 ego 的 service 实例本身就带一个可见窗口，wake 脚本什么也命中不了——所以 `showWindow` **默认关闭**，不去动别人应用的窗口可见性。
 
 **2. 千万别在要跑 screencast 的 target 上调 `Page.captureScreenshot`。**
 窗口最小化时它会报 `Cannot capture a screenshot while the window is minimized.` 并超时，而这个超时会让该 target 的 screencast **永久不再出帧**（重启 ego 才能恢复）。早期所有「0 帧」的排查都是踩在这上面。要帧就用 screencast，不要混着截图。
@@ -95,9 +105,12 @@ ego.exe 用 `--startup-ego-browser-service` 起来时窗口是隐藏的（`IsWin
 | `space` | `''` | 空 = 自动跟随最新 space；填名字或 id 就固定看那个 |
 | `idleTimeoutMs` | `20000` | 多久没心跳就重启 bridge |
 | `healthCheckMs` | `5000` | 看门狗检查间隔；`0` 关闭（不推荐，见下） |
+| `showWindow` | `false` | 把隐藏的 ego 窗口显示成最小化（只在老版 ego 上需要） |
 | `egoBinary` | `ego-browser` | CLI 路径 |
 
-`healthCheckMs` 不能关：MJPEG 的 `<img>` 是一个长连接，断了之后浏览器**不会再发新请求**，所以没有看门狗的话管道一死侧边栏就永久冻住，直到用户手动刷新页面。看门狗判活用的是 metadata 心跳而不是帧到达（静态页本来就不出帧）。
+`healthCheckMs` 不能关：MJPEG 的 `<img>` 是一个长连接，断了之后浏览器**不会再发新请求**，所以没有看门狗的话管道一死侧边栏就永久冻住，直到用户手动刷新页面。看门狗判活用的是 metadata 心跳而不是帧到达（静态页本来就不出帧），而且它只在有观众时才动手。
+
+想让插件完全不干涉 ego 的启动（比如你自己管 ego 的生命周期），把 `healthCheckMs` 设 `0` 并别打开那个 tab 就行——没有人拉流，bridge 根本没起来。
 
 改完代码要**重启 DSH** 才生效（bridge.mjs 只在插件加载时复制到 `%TEMP%\ego-liveview-runtime\`，运行中的 pump 是内存里的旧版）。
 
