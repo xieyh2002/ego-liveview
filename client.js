@@ -22,6 +22,8 @@ window.__ModuleLoader__.load({
     const STATUS_URL = '/ego-live/status';
     const STATUS_POLL_MS = 1500;
     const POLL_MS = 120;
+    /** Consecutive unhealthy status polls before the <img> is remounted. */
+    const STALL_TICKS = 4;
 
     /** Read the active locale so text follows the host's language. */
     function pick(ctx, zh, en) {
@@ -195,14 +197,31 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         if (!visible) return undefined;
         let alive = true;
+        let deadTicks = 0;
         const tick = async () => {
           try {
             const res = await fetch(`${STATUS_URL}?n=${Date.now()}`, { cache: 'no-store' });
             if (!res.ok) throw new Error(String(res.status));
             const body = await res.json();
-            if (alive) setStatus(body);
+            if (!alive) return;
+            setStatus(body);
+            // The host restarts a dead bridge on its own, but the <img> is
+            // already bound to one long-lived response that may have been torn
+            // down with it. Remount the image after a sustained outage so a
+            // wedged stream recovers without the user clicking anything.
+            deadTicks = body && body.ok ? 0 : deadTicks + 1;
+            if (deadTicks >= STALL_TICKS) {
+              deadTicks = 0;
+              setNonce((n) => n + 1);
+            }
           } catch {
-            if (alive) setStatus(null);
+            if (!alive) return;
+            setStatus(null);
+            deadTicks += 1;
+            if (deadTicks >= STALL_TICKS) {
+              deadTicks = 0;
+              setNonce((n) => n + 1);
+            }
           }
         };
         void tick();
@@ -245,6 +264,11 @@ window.__ModuleLoader__.load({
       // is the fallback when a page has no title yet.
       const subject = String(watched.title || watched.url || '');
       const spaceName = watched.space ? String(watched.space) : '';
+      // A reachable host with no page to watch is not a broken connection: ego
+      // may simply have restarted and dropped every task space. Say so instead
+      // of showing an empty black stage that looks like a hang.
+      const idle = live && !subject;
+      const known = url && Array.isArray(url.spaces) ? url.spaces.length : 0;
 
       return h(
         'div',
@@ -275,6 +299,28 @@ window.__ModuleLoader__.load({
                 draggable: false,
                 onError: () => setStatus(null),
               })),
+          idle
+            ? h(
+                'div',
+                { style: S.center },
+                h(
+                  'div',
+                  null,
+                  t(
+                    known > 0 ? 'ego 里有页面，但还没有可显示的内容。' : 'ego 里还没有打开的网页。',
+                    known > 0 ? 'ego has a page, but nothing to show yet.' : 'No page is open in ego yet.',
+                  ),
+                ),
+                h(
+                  'div',
+                  null,
+                  t(
+                    '让 dsh 用 ego 打开一个网页，这里会自动显示。',
+                    'Ask dsh to open a page in ego and it will appear here.',
+                  ),
+                ),
+              )
+            : null,
         ),
         h(
           'div',

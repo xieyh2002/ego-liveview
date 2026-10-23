@@ -51,14 +51,19 @@ const TYPE_META = 2;
 const HEADER_BYTES = 5;
 const MAX_PAYLOAD = 8 * 1024 * 1024;
 
+/** How long a single MJPEG part may sit unflushed before the viewer is unmuted. */
+const WRITE_STALL_MS = 1_000;
+
 const DEFAULTS = {
   quality: 60,
   maxWidth: 960,
   maxHeight: 600,
   /** Name or numeric id of the ego task space to watch. Empty = auto-follow. */
   space: '',
-  /** Restart the bridge if no frame arrives for this long. */
+  /** Restart the bridge if no metadata heartbeat arrives for this long. */
   idleTimeoutMs: 20_000,
+  /** How often the watchdog re-checks the bridge. 0 disables it. */
+  healthCheckMs: 5_000,
   egoBinary: 'ego-browser',
 };
 
@@ -197,10 +202,20 @@ await import(${JSON.stringify('file:///' + runtimeBridge.replace(/\\/g, '/'))});
       `--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${jpeg.length}\r\n\r\n`,
       'ascii',
     );
-    res.write(Buffer.concat([head, jpeg, Buffer.from('\r\n', 'ascii')]), () => {
+    // If a client stops draining for good, the write callback never fires and
+    // __egoBusy stays true, muting that viewer forever. Release the flag on a
+    // timer as well so a stalled consumer self-heals on the next frame.
+    const release = () => {
+      if (!res.__egoBusy) return;
       res.__egoBusy = false;
       const pending = res.__egoPending;
       if (pending) writePart(res, pending);
+    };
+    const timer = setTimeout(release, WRITE_STALL_MS);
+    timer.unref?.();
+    res.write(Buffer.concat([head, jpeg, Buffer.from('\r\n', 'ascii')]), () => {
+      clearTimeout(timer);
+      release();
     });
   }
 
@@ -223,11 +238,19 @@ await import(${JSON.stringify('file:///' + runtimeBridge.replace(/\\/g, '/'))});
       });
       bridge.child = child;
 
+      // A spawn that fails outright (binary missing, no permission) emits
+      // 'error' and never creates the pipe. Waiting out the connect deadline
+      // would just stall the watchdog's next retry behind a pointless 20 s
+      // poll, so fail fast instead.
+      let spawnFailed = null;
+      child.on('error', (err) => {
+        spawnFailed = err;
+        note(`failed to spawn ${conf.egoBinary}: ${err.message}`);
+      });
       // The CLI's own stdout is closed by the host once the module returns;
       // stderr is buffered until exit. Neither is a reliable log channel.
       child.stdout?.on('data', () => {});
       child.stderr?.on('data', (d) => note(`ego stderr: ${String(d).slice(0, 400).trim()}`));
-      child.on('error', (err) => note(`failed to spawn ${conf.egoBinary}: ${err.message}`));
       child.on('exit', (code) => note(`ego cli exited (${code}); pump may still run in-host`));
 
       // Retry connecting: the pipe exists only after the host has loaded the
@@ -235,6 +258,7 @@ await import(${JSON.stringify('file:///' + runtimeBridge.replace(/\\/g, '/'))});
       const deadline = Date.now() + 20_000;
       let socket = null;
       while (Date.now() < deadline) {
+        if (spawnFailed) break;
         socket = await new Promise((resolve) => {
           const s = net.connect(pipe);
           const fail = () => {
@@ -251,7 +275,7 @@ await import(${JSON.stringify('file:///' + runtimeBridge.replace(/\\/g, '/'))});
         await new Promise((r) => setTimeout(r, 150));
       }
       if (!socket) {
-        note('pipe never became connectable');
+        note(spawnFailed ? `giving up: ${conf.egoBinary} did not start` : 'pipe never became connectable');
         return false;
       }
       bridge.socket = socket;
@@ -281,6 +305,10 @@ await import(${JSON.stringify('file:///' + runtimeBridge.replace(/\\/g, '/'))});
       bridge.socket = null;
       old.destroy();
     }
+    // A fresh launch gets a full grace period: lastMetaAt is otherwise still
+    // 0 (or long stale) and the watchdog would restart the bridge it just
+    // started, forever, before the first metadata tick ever arrives.
+    lastMetaAt = Date.now();
     return startBridge();
   }
 
@@ -389,7 +417,20 @@ await import(${JSON.stringify('file:///' + runtimeBridge.replace(/\\/g, '/'))});
   // Warm the bridge so the first sidebar click is instant rather than ~1 s.
   void ensureBridge().catch((err) => note(`warmup: ${err.message}`));
 
+  // MJPEG viewers hold one long-lived response and never re-request, so nothing
+  // calls ensureBridge() after the initial attach. Without this watchdog a pipe
+  // that dies (ego closed the connection, ego restarted, the CLI exited) leaves
+  // the sidebar frozen forever — the <img> has no way to trigger a restart.
+  let watchdog = null;
+  if (conf.healthCheckMs > 0) {
+    watchdog = setInterval(() => {
+      ensureBridge().catch((err) => note(`watchdog: ${err.message}`));
+    }, conf.healthCheckMs);
+    watchdog.unref?.();
+  }
+
   ctx.effect(() => () => {
+    if (watchdog) clearInterval(watchdog);
     for (const dispose of disposers) {
       try {
         dispose();
