@@ -1,0 +1,47 @@
+{
+  "name": "@local/ego-liveview",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Live view of the ego browser inside the DSH sidebar.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xieyh2002/ego-liveview.git"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "ego",
+    "sidebar",
+    "screencast",
+    "mjpeg"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "bridge/bridge.mjs",
+    "bridge/wake-windows.ps1",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    }
+  }
+}

@@ -1,0 +1,4 @@
+- insert:
+    - id: ego-liveview
+      name: '@local/ego-liveview'
+      config: {}

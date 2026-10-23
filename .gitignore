@@ -1,0 +1,14 @@
+# Scratch space for probing ego internals during development: 75 scripts,
+# captured logs and a sample frame. Not part of the plugin.
+_dev/
+
+# Runtime artifacts written by the bridge while it runs.
+*.log
+
+# Anything mirrored from %TEMP%\ego-liveview-runtime\ for debugging.
+bridge/boot.mjs
+config.json
+
+node_modules/
+.DS_Store
+Thumbs.db

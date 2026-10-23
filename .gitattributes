@@ -1,0 +1,10 @@
+# Keep the repo LF so the bridge and client scripts behave the same for
+# everyone; Windows checkouts were otherwise rewriting every line.
+* text=auto eol=lf
+
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+
+*.jpg binary
+*.png binary
+*.bin binary
